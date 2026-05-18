@@ -676,6 +676,7 @@ def main():
         entry_points=[
             CommandHandler("feedback", feedback_start),
             MessageHandler(filters.Regex("^/feedback$"), feedback_start),
+            MessageHandler(filters.Regex("^📋 Залишити ще один фідбек$"), feedback_start),
         ],
         states={
             CHOOSE_TYPE:    [MessageHandler(filters.TEXT & ~filters.COMMAND, choose_type)],
@@ -715,7 +716,6 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myfeedback", my_feedback))
-    app.add_handler(MessageHandler(filters.Regex("^📋 Залишити ще один фідбек$"), feedback_start))
     app.add_handler(MessageHandler(filters.Regex("^📁 Мої відгуки$"), my_feedback))
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
