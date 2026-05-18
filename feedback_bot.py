@@ -36,9 +36,19 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN        = os.environ["BOT_TOKEN"]
 ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
 SHEETS_ID        = os.environ["GOOGLE_SHEETS_ID"]
-GOOGLE_CREDS_JSON= os.environ["GOOGLE_CREDENTIALS_JSON"]
-WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")
-PORT             = int(os.environ.get("PORT", 8443))
+GOOGLE_CREDS_JSON       = os.environ["GOOGLE_CREDENTIALS_JSON"]
+WEBHOOK_URL             = os.environ.get("WEBHOOK_URL", "")
+PORT                    = int(os.environ.get("PORT", 8443))
+DEFAULT_VERSION_IOS     = os.environ.get("DEFAULT_VERSION_IOS", "")      # напр. "2.1.0"
+DEFAULT_VERSION_ANDROID = os.environ.get("DEFAULT_VERSION_ANDROID", "")  # напр. "2.0.5"
+
+def get_default_version(platform: str) -> str:
+    """Повертає версію за замовчуванням для платформи."""
+    if platform == "iOS":
+        return DEFAULT_VERSION_IOS
+    if platform == "Android":
+        return DEFAULT_VERSION_ANDROID
+    return ""
 
 # ─── Стани ConversationHandler ─────────────────────────────────────────────────
 (
@@ -46,7 +56,7 @@ PORT             = int(os.environ.get("PORT", 8443))
     # Спільне
     ASK_VERSION,
     # Баг
-    BUG_SCREEN, BUG_DESC, BUG_PLATFORM, BUG_MEDIA,
+    BUG_SCREEN, BUG_PLATFORM, BUG_VERSION, BUG_DESC, BUG_MEDIA,
     # Загальна оцінка
     GEN_IMPRESSION, GEN_COMFORT, GEN_RECOMMEND, GEN_NPS, GEN_IMPROVE, GEN_PLATFORM,
     # Ідея
@@ -55,7 +65,7 @@ PORT             = int(os.environ.get("PORT", 8443))
     ASK_PHONE,
     # Перегляд
     MY_FEEDBACK,
-) = range(17)
+) = range(18)
 
 # ─── Google Sheets ─────────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -86,6 +96,51 @@ def append_row(sheet_name: str, row: list):
         ).execute()
     except Exception as e:
         logger.error(f"Sheets error: {e}")
+        log_to_sheets("ERROR", f"append_row({sheet_name}): {e}")
+
+def log_to_sheets(level: str, message: str):
+    """Записує лог помилки в аркуш Logs. Не кидає виняток."""
+    try:
+        svc = get_sheets_service()
+        svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID,
+            range="Logs!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[now_str(), level, message]]}
+        ).execute()
+    except Exception:
+        pass  # логування не має ламати бота
+
+def check_duplicate_bug(screen: str, description: str) -> Optional[str]:
+    """Перевіряє чи є схожий баг в Sheets. Повертає дату дубліката або None."""
+    try:
+        svc = get_sheets_service()
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID,
+            range="Bugs!A:G"
+        ).execute()
+        rows = result.get("values", [])[1:]  # пропускаємо заголовок
+
+        screen_norm = screen.lower().strip()
+        desc_words  = set(description.lower().split())
+
+        for row in rows:
+            if len(row) < 7:
+                continue
+            existing_screen = row[5].lower().strip()
+            existing_desc   = row[6].lower()
+
+            # Збіг екрану + більше 50% слів опису
+            existing_words = set(existing_desc.split())
+            if existing_screen == screen_norm and len(desc_words) > 0:
+                overlap = len(desc_words & existing_words) / len(desc_words)
+                if overlap >= 0.5:
+                    return row[0]  # дата дубліката
+        return None
+    except Exception as e:
+        logger.error(f"Duplicate check error: {e}")
+        return None
 
 def get_user_rows(sheet_name: str, telegram_id: str) -> list[list]:
     try:
@@ -235,6 +290,12 @@ async def choose_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     choice = update.message.text
     if "Баг" in choice:
         ctx.user_data["type"] = "bug"
+        # Для багу версія питається після платформи — одразу на екран
+        await update.message.reply_text(
+            "🖥 На якому екрані / в якій функції виникла проблема?",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return BUG_SCREEN
     elif "Загальна" in choice:
         ctx.user_data["type"] = "general"
     elif "Ідея" in choice:
@@ -243,25 +304,20 @@ async def choose_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Будь ласка, обери один із варіантів 👆")
         return CHOOSE_TYPE
 
-    await update.message.reply_text(
-        "📱 Яку версію застосунку тестуєш?\n_(необов'язково — натисни Пропустити)_",
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=SKIP_KB
-    )
-    return ASK_VERSION
+    # General і Idea — питаємо версію через DEFAULT якщо не задано
+    if DEFAULT_VERSION_IOS and DEFAULT_VERSION_ANDROID:
+        # Для General/Idea версія залежить від платформи — поки що пропускаємо
+        ctx.user_data["version"] = ""
+    return await route_after_version(update, ctx)
 
 async def ask_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     ctx.user_data["version"] = "" if text == "⏭ Пропустити" else text
+    return await route_after_version(update, ctx)
 
+async def route_after_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ftype = ctx.user_data["type"]
-    if ftype == "bug":
-        await update.message.reply_text(
-            "🖥 На якому екрані / в якій функції виникла проблема?",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return BUG_SCREEN
-    elif ftype == "general":
+    if ftype == "general":
         await update.message.reply_text(
             "📱 Яку платформу використовуєш?",
             reply_markup=PLATFORM_KB
@@ -277,11 +333,6 @@ async def ask_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── БАГ флоу ─────────────────────────────────────────────────────────────────
 async def bug_screen(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["screen"] = update.message.text
-    await update.message.reply_text("📝 Опиши баг — що саме відбулося?")
-    return BUG_DESC
-
-async def bug_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["description"] = update.message.text
     await update.message.reply_text(
         "📱 Яку платформу використовуєш?",
         reply_markup=PLATFORM_KB
@@ -294,6 +345,35 @@ async def bug_platform(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Будь ласка, обери iOS або Android 👆")
         return BUG_PLATFORM
     ctx.user_data["platform"] = text
+
+    # Версія: автоматично якщо задана для цієї платформи
+    default_ver = get_default_version(text)
+    if default_ver:
+        ctx.user_data["version"] = default_ver
+        await update.message.reply_text(
+            "📝 Опиши баг — що саме відбулося?",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return BUG_DESC
+    else:
+        await update.message.reply_text(
+            "📱 Яку версію застосунку тестуєш?\n_(необов'язково — натисни Пропустити)_",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=SKIP_KB
+        )
+        return BUG_VERSION
+
+async def bug_version(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    ctx.user_data["version"] = "" if text == "⏭ Пропустити" else text
+    await update.message.reply_text(
+        "📝 Опиши баг — що саме відбулося?",
+        reply_markup=ReplyKeyboardRemove()
+    )
+    return BUG_DESC
+
+async def bug_desc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["description"] = update.message.text
     await update.message.reply_text(
         "📎 Додай скриншот якщо є\n_(необов'язково — натисни Пропустити)_",
         parse_mode=ParseMode.MARKDOWN,
@@ -324,6 +404,9 @@ async def gen_platform(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Будь ласка, обери iOS або Android 👆")
         return GEN_PLATFORM
     ctx.user_data["platform"] = text
+    # Версія автоматично по платформі
+    default_ver = get_default_version(text)
+    ctx.user_data["version"] = default_ver if default_ver else ctx.user_data.get("version", "")
     await update.message.reply_text(
         "🎭 Яке твоє загальне враження від застосунку?",
         reply_markup=IMPRESSION_KB
@@ -464,6 +547,11 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ai_summary = await generate_ai_summary(ftype, data)
 
     if ftype == "bug":
+        # Перевірка дублікатів
+        duplicate_date = check_duplicate_bug(
+            data.get("screen", ""),
+            data.get("description", "")
+        )
         row = [
             ts, uid, user.username or "", user.first_name or "",
             data.get("version", ""),
@@ -475,8 +563,9 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ai_summary
         ]
         append_row("Bugs", row)
+        dup_note = f"\n⚠️ _Схожий баг вже є від {duplicate_date}_" if duplicate_date else ""
         confirm = (
-            f"✅ *Баг записано* | {ts}\n\n"
+            f"✅ *Баг записано* | {ts}{dup_note}\n\n"
             f"📍 Екран: {data.get('screen','—')}\n"
             f"📝 Опис: {data.get('description','—')}\n"
             f"📱 Платформа: {data.get('platform','—')}"
@@ -593,8 +682,9 @@ def main():
             ASK_VERSION:    [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_version)],
             # Баг
             BUG_SCREEN:     [MessageHandler(filters.TEXT & ~filters.COMMAND, bug_screen)],
-            BUG_DESC:       [MessageHandler(filters.TEXT & ~filters.COMMAND, bug_desc)],
             BUG_PLATFORM:   [MessageHandler(filters.TEXT & ~filters.COMMAND, bug_platform)],
+            BUG_VERSION:    [MessageHandler(filters.TEXT & ~filters.COMMAND, bug_version)],
+            BUG_DESC:       [MessageHandler(filters.TEXT & ~filters.COMMAND, bug_desc)],
             BUG_MEDIA:      [MessageHandler(
                 (filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.Document.ALL,
                 bug_media
