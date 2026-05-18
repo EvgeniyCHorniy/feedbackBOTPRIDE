@@ -36,10 +36,9 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN        = os.environ["BOT_TOKEN"]
 ANTHROPIC_KEY    = os.environ["ANTHROPIC_API_KEY"]
 SHEETS_ID        = os.environ["GOOGLE_SHEETS_ID"]
-GOOGLE_CREDS_JSON= os.environ["GOOGLE_CREDENTIALS_JSON"]  # JSON-рядок service account
-WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")       # https://your-app.onrender.com
+GOOGLE_CREDS_JSON= os.environ["GOOGLE_CREDENTIALS_JSON"]
+WEBHOOK_URL      = os.environ.get("WEBHOOK_URL", "")
 PORT             = int(os.environ.get("PORT", 8443))
-DATA_FILE        = os.environ.get("DATA_FILE", "users.json")
 
 # ─── Стани ConversationHandler ─────────────────────────────────────────────────
 (
@@ -65,6 +64,15 @@ def get_sheets_service():
     creds_info = json.loads(GOOGLE_CREDS_JSON)
     creds = service_account.Credentials.from_service_account_info(creds_info, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds)
+
+async def get_telegram_file_url(bot, file_id: str) -> str:
+    """Повертає пряме посилання на файл через Telegram Bot API."""
+    try:
+        tg_file = await bot.get_file(file_id)
+        return tg_file.file_path  # вже повне https://api.telegram.org/file/bot.../...
+    except Exception as e:
+        logger.error(f"get_file error: {e}")
+        return f"photo:{file_id}"
 
 def append_row(sheet_name: str, row: list):
     try:
@@ -93,28 +101,61 @@ def get_user_rows(sheet_name: str, telegram_id: str) -> list[list]:
         logger.error(f"Sheets read error: {e}")
         return []
 
-# ─── Локальне сховище користувачів ────────────────────────────────────────────
-def load_users() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_users(data: dict):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# ─── Сховище користувачів — Google Sheets аркуш "Users" ──────────────────────
+# Структура аркуша Users: TG ID | Телефон | Ім'я | Дата реєстрації
 
 def get_user_phone(telegram_id: int) -> Optional[str]:
-    users = load_users()
-    return users.get(str(telegram_id), {}).get("phone")
+    """Шукає збережений телефон користувача в аркуші Users."""
+    try:
+        svc = get_sheets_service()
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID,
+            range="Users!A:B"
+        ).execute()
+        rows = result.get("values", [])
+        uid = str(telegram_id)
+        for row in rows[1:]:  # пропускаємо заголовок
+            if len(row) >= 2 and row[0] == uid and row[1]:
+                return row[1]
+        return None
+    except Exception as e:
+        logger.error(f"Users read error: {e}")
+        return None
 
-def save_user_phone(telegram_id: int, phone: str):
-    users = load_users()
-    uid = str(telegram_id)
-    if uid not in users:
-        users[uid] = {}
-    users[uid]["phone"] = phone
-    save_users(users)
+def save_user_phone(telegram_id: int, phone: str, name: str = ""):
+    """Зберігає або оновлює телефон користувача в аркуші Users."""
+    try:
+        svc = get_sheets_service()
+        uid = str(telegram_id)
+        ts  = now_str()
+
+        # Перевіряємо чи існує вже запис
+        result = svc.spreadsheets().values().get(
+            spreadsheetId=SHEETS_ID,
+            range="Users!A:A"
+        ).execute()
+        rows = result.get("values", [])
+        for i, row in enumerate(rows):
+            if row and row[0] == uid:
+                # Оновлюємо телефон у колонці B (рядок i+1, нумерація з 1)
+                svc.spreadsheets().values().update(
+                    spreadsheetId=SHEETS_ID,
+                    range=f"Users!B{i+1}",
+                    valueInputOption="USER_ENTERED",
+                    body={"values": [[phone]]}
+                ).execute()
+                return
+
+        # Новий користувач — додаємо рядок
+        svc.spreadsheets().values().append(
+            spreadsheetId=SHEETS_ID,
+            range="Users!A1",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[uid, phone, name, ts]]}
+        ).execute()
+    except Exception as e:
+        logger.error(f"Users write error: {e}")
 
 # ─── Claude AI Summary ─────────────────────────────────────────────────────────
 async def generate_ai_summary(feedback_type: str, data: dict) -> str:
@@ -264,9 +305,13 @@ async def bug_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "⏭ Пропустити":
         ctx.user_data["media_url"] = ""
     elif update.message.photo:
-        ctx.user_data["media_url"] = f"photo:{update.message.photo[-1].file_id}"
+        file_id = update.message.photo[-1].file_id
+        url = await get_telegram_file_url(update.get_bot(), file_id)
+        ctx.user_data["media_url"] = url
     elif update.message.document:
-        ctx.user_data["media_url"] = f"doc:{update.message.document.file_id}"
+        file_id = update.message.document.file_id
+        url = await get_telegram_file_url(update.get_bot(), file_id)
+        ctx.user_data["media_url"] = url
     else:
         ctx.user_data["media_url"] = update.message.text
 
@@ -328,12 +373,13 @@ async def gen_nps(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["nps"] = update.message.text
     await update.message.reply_text(
         "✏️ Що варто покращити, щоб ти поставив вищу оцінку?",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=SKIP_KB
     )
     return GEN_IMPROVE
 
 async def gen_improve(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["improve"] = update.message.text
+    text = update.message.text
+    ctx.user_data["improve"] = "" if text == "⏭ Пропустити" else text
     return await ask_phone_or_finish(update, ctx)
 
 # ─── ІДЕЯ флоу ────────────────────────────────────────────────────────────────
@@ -355,9 +401,13 @@ async def idea_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.message.text == "⏭ Пропустити":
         ctx.user_data["media_url"] = ""
     elif update.message.photo:
-        ctx.user_data["media_url"] = f"photo:{update.message.photo[-1].file_id}"
+        file_id = update.message.photo[-1].file_id
+        url = await get_telegram_file_url(update.get_bot(), file_id)
+        ctx.user_data["media_url"] = url
     elif update.message.document:
-        ctx.user_data["media_url"] = f"doc:{update.message.document.file_id}"
+        file_id = update.message.document.file_id
+        url = await get_telegram_file_url(update.get_bot(), file_id)
+        ctx.user_data["media_url"] = url
     else:
         ctx.user_data["media_url"] = update.message.text
 
@@ -386,16 +436,18 @@ async def ask_phone_or_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ASK_PHONE
 
 async def receive_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
+    name = update.effective_user.first_name or ""
     if update.message.contact:
         phone = update.message.contact.phone_number
-        save_user_phone(uid, phone)
+        save_user_phone(uid, phone, name)
         ctx.user_data["phone"] = phone
     elif update.message.text == "⏭ Пропустити":
         ctx.user_data["phone"] = ""
     else:
-        ctx.user_data["phone"] = update.message.text
-        save_user_phone(uid, update.message.text)
+        phone = update.message.text
+        save_user_phone(uid, phone, name)
+        ctx.user_data["phone"] = phone
 
     await finish_feedback(update, ctx)
     return ConversationHandler.END
@@ -465,14 +517,18 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         confirm = (
             f"✅ *Ідею записано* | {ts}\n\n"
             f"💡 Ідея: {data.get('description','—')[:80]}...\n"
-            f"🎯 Проблема: {data.get('problem','—')[:80]}..."
+            f"🎯 Навіщо: {data.get('problem','—')[:80]}..."
         )
 
+    after_kb = ReplyKeyboardMarkup(
+        [["📋 Залишити ще один фідбек"], ["📁 Мої відгуки"]],
+        one_time_keyboard=False,
+        resize_keyboard=True
+    )
     await update.message.reply_text(
-        f"{confirm}\n\n🤖 _AI-висновок: {ai_summary}_\n\n"
-        "Дякуємо! Твій фідбек дуже важливий для нас 🙏",
+        f"{confirm}\n\nДякуємо! Твій фідбек дуже важливий для нас 🙏",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=after_kb
     )
 
 # ─── /myfeedback ──────────────────────────────────────────────────────────────
@@ -497,9 +553,12 @@ async def my_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     text = "📋 *Твої останні відгуки:*\n\n"
     icons = {"Bugs": "🐛", "Ideas": "💡", "General": "⭐"}
+    # Індекс поля з описом для кожного аркуша: Bugs→col6(Опис), Ideas→col5(Опис), General→col6(Враження)
+    desc_idx = {"Bugs": 6, "Ideas": 5, "General": 6}
     for sheet, row in recent:
         date = row[0] if row else "—"
-        desc = row[5] if len(row) > 5 else "—"
+        idx  = desc_idx.get(sheet, 5)
+        desc = row[idx] if len(row) > idx else "—"
         text += f"{icons.get(sheet,'📝')} *{sheet}* | {date}\n_{desc[:60]}..._\n\n"
 
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
@@ -566,6 +625,8 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("myfeedback", my_feedback))
+    app.add_handler(MessageHandler(filters.Regex("^📋 Залишити ще один фідбек$"), feedback_start))
+    app.add_handler(MessageHandler(filters.Regex("^📁 Мої відгуки$"), my_feedback))
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
 
