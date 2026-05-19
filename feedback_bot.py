@@ -727,7 +727,6 @@ def main():
             port=PORT,
             webhook_url=f"{WEBHOOK_URL}/webhook",
             url_path="webhook",
-            health_check_endpoint="/health",
         )
     else:
         logger.info("Запуск через polling (локально)")
