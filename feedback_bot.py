@@ -6,6 +6,7 @@ Telegram-бот для збору фідбеку від тестувальник
 
 import os
 import json
+import time
 import logging
 import asyncio
 from datetime import datetime
@@ -41,6 +42,9 @@ WEBHOOK_URL             = os.environ.get("WEBHOOK_URL", "")
 PORT                    = int(os.environ.get("PORT", 8443))
 DEFAULT_VERSION_IOS     = os.environ.get("DEFAULT_VERSION_IOS", "")      # напр. "2.1.0"
 DEFAULT_VERSION_ANDROID = os.environ.get("DEFAULT_VERSION_ANDROID", "")  # напр. "2.0.5"
+
+# Проста анти-спам конфігурація (можна змінити через env, не обов'язково)
+MAX_FEEDBACKS_PER_HOUR = int(os.environ.get("MAX_FEEDBACKS_PER_HOUR", "10"))
 
 def get_default_version(platform: str) -> str:
     """Повертає версію за замовчуванням для платформи."""
@@ -84,7 +88,20 @@ async def get_telegram_file_url(bot, file_id: str) -> str:
         logger.error(f"get_file error: {e}")
         return f"photo:{file_id}"
 
-def append_row(sheet_name: str, row: list):
+# ─── Захист від formula injection у Google Sheets ─────────────────────────────
+def sanitize_cell(value):
+    """Екранує значення, що починається з =, +, -, @ — щоб Sheets не сприймав
+    їх як формулу (актуально при valueInputOption=USER_ENTERED)."""
+    if isinstance(value, str) and value and value[0] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
+
+def sanitize_row(row: list) -> list:
+    return [sanitize_cell(v) for v in row]
+
+# ─── Синхронні "ядра" викликів до Google Sheets (виконуються в окремому потоці) ─
+
+def _append_row_sync(sheet_name: str, row: list):
     try:
         svc = get_sheets_service()
         svc.spreadsheets().values().append(
@@ -92,13 +109,13 @@ def append_row(sheet_name: str, row: list):
             range=f"{sheet_name}!A1",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [row]}
+            body={"values": [sanitize_row(row)]}
         ).execute()
     except Exception as e:
         logger.error(f"Sheets error: {e}")
-        log_to_sheets("ERROR", f"append_row({sheet_name}): {e}")
+        _log_to_sheets_sync("ERROR", f"append_row({sheet_name}): {e}")
 
-def log_to_sheets(level: str, message: str):
+def _log_to_sheets_sync(level: str, message: str):
     """Записує лог помилки в аркуш Logs. Не кидає виняток."""
     try:
         svc = get_sheets_service()
@@ -112,7 +129,7 @@ def log_to_sheets(level: str, message: str):
     except Exception:
         pass  # логування не має ламати бота
 
-def check_duplicate_bug(screen: str, description: str) -> Optional[str]:
+def _check_duplicate_bug_sync(screen: str, description: str) -> Optional[str]:
     """Перевіряє чи є схожий баг в Sheets. Повертає дату дубліката або None."""
     try:
         svc = get_sheets_service()
@@ -142,7 +159,7 @@ def check_duplicate_bug(screen: str, description: str) -> Optional[str]:
         logger.error(f"Duplicate check error: {e}")
         return None
 
-def get_user_rows(sheet_name: str, telegram_id: str) -> list[list]:
+def _get_user_rows_sync(sheet_name: str, telegram_id: str) -> list:
     try:
         svc = get_sheets_service()
         result = svc.spreadsheets().values().get(
@@ -156,10 +173,7 @@ def get_user_rows(sheet_name: str, telegram_id: str) -> list[list]:
         logger.error(f"Sheets read error: {e}")
         return []
 
-# ─── Сховище користувачів — Google Sheets аркуш "Users" ──────────────────────
-# Структура аркуша Users: TG ID | Телефон | Ім'я | Дата реєстрації
-
-def get_user_phone(telegram_id: int) -> Optional[str]:
+def _get_user_phone_sync(telegram_id: int) -> Optional[str]:
     """Шукає збережений телефон користувача в аркуші Users."""
     try:
         svc = get_sheets_service()
@@ -177,7 +191,7 @@ def get_user_phone(telegram_id: int) -> Optional[str]:
         logger.error(f"Users read error: {e}")
         return None
 
-def save_user_phone(telegram_id: int, phone: str, name: str = ""):
+def _save_user_phone_sync(telegram_id: int, phone: str, name: str = ""):
     """Зберігає або оновлює телефон користувача в аркуші Users."""
     try:
         svc = get_sheets_service()
@@ -197,7 +211,7 @@ def save_user_phone(telegram_id: int, phone: str, name: str = ""):
                     spreadsheetId=SHEETS_ID,
                     range=f"Users!B{i+1}",
                     valueInputOption="USER_ENTERED",
-                    body={"values": [[phone]]}
+                    body={"values": [[sanitize_cell(phone)]]}
                 ).execute()
                 return
 
@@ -207,13 +221,12 @@ def save_user_phone(telegram_id: int, phone: str, name: str = ""):
             range="Users!A1",
             valueInputOption="USER_ENTERED",
             insertDataOption="INSERT_ROWS",
-            body={"values": [[uid, phone, name, ts]]}
+            body={"values": [sanitize_row([uid, phone, name, ts])]}
         ).execute()
     except Exception as e:
         logger.error(f"Users write error: {e}")
 
-# ─── Claude AI Summary ─────────────────────────────────────────────────────────
-async def generate_ai_summary(feedback_type: str, data: dict) -> str:
+def _generate_ai_summary_sync(feedback_type: str, data: dict) -> str:
     client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
     prompt = f"""Ти аналітик продукту. Проаналізуй фідбек тестувальника мобільного застосунку та дай короткий висновок (2-3 речення) українською мовою.
 
@@ -233,11 +246,43 @@ async def generate_ai_summary(feedback_type: str, data: dict) -> str:
         logger.error(f"Claude API error: {e}")
         return "AI-аналіз недоступний"
 
+# ─── Async-обгортки — те, що реально викликається з хендлерів ─────────────────
+# Кожна з них виконує блокуючий виклик у окремому потоці, щоб НЕ зупиняти
+# event loop бота для інших користувачів під час звернення до Sheets/Claude.
+
+async def append_row(sheet_name: str, row: list):
+    await asyncio.to_thread(_append_row_sync, sheet_name, row)
+
+async def log_to_sheets(level: str, message: str):
+    await asyncio.to_thread(_log_to_sheets_sync, level, message)
+
+async def check_duplicate_bug(screen: str, description: str) -> Optional[str]:
+    return await asyncio.to_thread(_check_duplicate_bug_sync, screen, description)
+
+async def get_user_rows(sheet_name: str, telegram_id: str) -> list:
+    return await asyncio.to_thread(_get_user_rows_sync, sheet_name, telegram_id)
+
+async def get_user_phone(telegram_id: int) -> Optional[str]:
+    return await asyncio.to_thread(_get_user_phone_sync, telegram_id)
+
+async def save_user_phone(telegram_id: int, phone: str, name: str = ""):
+    await asyncio.to_thread(_save_user_phone_sync, telegram_id, phone, name)
+
+async def generate_ai_summary(feedback_type: str, data: dict) -> str:
+    return await asyncio.to_thread(_generate_ai_summary_sync, feedback_type, data)
+
 # ─── Допоміжні функції ─────────────────────────────────────────────────────────
 def now_str() -> str:
     return datetime.now().strftime("%d.%m.%Y %H:%M")
 
-def make_keyboard(options: list[list[str]], one_time=True) -> ReplyKeyboardMarkup:
+def parse_ts(ts: str) -> datetime:
+    """Парсить дату у форматі now_str() для коректного сортування (не як текст)."""
+    try:
+        return datetime.strptime(ts, "%d.%m.%Y %H:%M")
+    except Exception:
+        return datetime.min
+
+def make_keyboard(options: list, one_time=True) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(options, one_time_keyboard=one_time, resize_keyboard=True)
 
 SKIP_KB = make_keyboard([["⏭ Пропустити"]])
@@ -261,6 +306,19 @@ NPS_KB = make_keyboard([
     ["6", "7", "8", "9", "10"]
 ])
 
+# ─── Проста антиспам-перевірка (in-memory, скидається при рестарті) ───────────
+def check_rate_limit(ctx: ContextTypes.DEFAULT_TYPE, uid: int) -> bool:
+    """Повертає True, якщо користувачу можна продовжити (ліміт не вичерпано)."""
+    bucket = ctx.application.bot_data.setdefault("feedback_times", {})
+    now = time.time()
+    times = [t for t in bucket.get(uid, []) if now - t < 3600]
+    bucket[uid] = times
+    return len(times) < MAX_FEEDBACKS_PER_HOUR
+
+def register_feedback_sent(ctx: ContextTypes.DEFAULT_TYPE, uid: int):
+    bucket = ctx.application.bot_data.setdefault("feedback_times", {})
+    bucket.setdefault(uid, []).append(time.time())
+
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name
@@ -275,6 +333,14 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ─── /feedback — вибір типу ───────────────────────────────────────────────────
 async def feedback_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not check_rate_limit(ctx, uid):
+        await update.message.reply_text(
+            "⏳ Ти вже залишив декілька відгуків нещодавно. "
+            "Спробуй, будь ласка, трохи пізніше — це допомагає нам обробляти фідбек якісно 🙏"
+        )
+        return ConversationHandler.END
+
     ctx.user_data.clear()
     await update.message.reply_text(
         "📋 Який тип фідбеку хочеш залишити?",
@@ -499,7 +565,7 @@ async def idea_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ─── Телефон ───────────────────────────────────────────────────────────────────
 async def ask_phone_or_finish(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    phone = get_user_phone(uid)
+    phone = await get_user_phone(uid)
     if phone:
         ctx.user_data["phone"] = phone
         await finish_feedback(update, ctx)
@@ -523,13 +589,13 @@ async def receive_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or ""
     if update.message.contact:
         phone = update.message.contact.phone_number
-        save_user_phone(uid, phone, name)
+        await save_user_phone(uid, phone, name)
         ctx.user_data["phone"] = phone
     elif update.message.text == "⏭ Пропустити":
         ctx.user_data["phone"] = ""
     else:
         phone = update.message.text
-        save_user_phone(uid, phone, name)
+        await save_user_phone(uid, phone, name)
         ctx.user_data["phone"] = phone
 
     await finish_feedback(update, ctx)
@@ -548,7 +614,7 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if ftype == "bug":
         # Перевірка дублікатів
-        duplicate_date = check_duplicate_bug(
+        duplicate_date = await check_duplicate_bug(
             data.get("screen", ""),
             data.get("description", "")
         )
@@ -562,7 +628,7 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data.get("phone", ""),
             ai_summary
         ]
-        append_row("Bugs", row)
+        await append_row("Bugs", row)
         dup_note = f"\n⚠️ _Схожий баг вже є від {duplicate_date}_" if duplicate_date else ""
         confirm = (
             f"✅ *Баг записано* | {ts}{dup_note}\n\n"
@@ -584,7 +650,7 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data.get("phone", ""),
             ai_summary
         ]
-        append_row("General", row)
+        await append_row("General", row)
         confirm = (
             f"✅ *Оцінку записано* | {ts}\n\n"
             f"📱 Платформа: {data.get('platform','—')}\n"
@@ -602,12 +668,14 @@ async def finish_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             data.get("phone", ""),
             ai_summary
         ]
-        append_row("Ideas", row)
+        await append_row("Ideas", row)
         confirm = (
             f"✅ *Ідею записано* | {ts}\n\n"
             f"💡 Ідея: {data.get('description','—')[:80]}...\n"
             f"🎯 Навіщо: {data.get('problem','—')[:80]}..."
         )
+
+    register_feedback_sent(ctx, update.effective_user.id)
 
     after_kb = ReplyKeyboardMarkup(
         [["📋 Залишити ще один фідбек"], ["📁 Мої відгуки"]],
@@ -626,7 +694,7 @@ async def my_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     all_rows = []
 
     for sheet in ["Bugs", "Ideas", "General"]:
-        rows = get_user_rows(sheet, uid)
+        rows = await get_user_rows(sheet, uid)
         for r in rows:
             all_rows.append((sheet, r))
 
@@ -636,8 +704,8 @@ async def my_feedback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Останні 5
-    all_rows.sort(key=lambda x: x[1][0] if x[1] else "", reverse=True)
+    # Останні 5 — сортуємо за реальною датою, а не як текст
+    all_rows.sort(key=lambda x: parse_ts(x[1][0]) if x[1] else datetime.min, reverse=True)
     recent = all_rows[:5]
 
     text = "📋 *Твої останні відгуки:*\n\n"
@@ -667,6 +735,26 @@ async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/feedback — залишити фідбек\n"
         "/myfeedback — мої відгуки"
     )
+
+# ─── Глобальний обробник помилок ───────────────────────────────────────────────
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
+    """Ловить будь-які необроблені винятки в хендлерах, щоб юзер не зависав
+    без відповіді і щоб бот не падав повністю через один поганий запит."""
+    logger.error("Необроблений виняток під час обробки update", exc_info=ctx.error)
+
+    try:
+        await log_to_sheets("ERROR", f"Unhandled exception: {ctx.error}")
+    except Exception:
+        pass
+
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Сталася технічна помилка. Спробуй, будь ласка, ще раз — /feedback",
+                reply_markup=ReplyKeyboardRemove()
+            )
+        except Exception:
+            pass
 
 # ─── Головна функція ───────────────────────────────────────────────────────────
 def main():
@@ -719,6 +807,8 @@ def main():
     app.add_handler(MessageHandler(filters.Regex("^📁 Мої відгуки$"), my_feedback))
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.COMMAND, unknown))
+
+    app.add_error_handler(error_handler)
 
     if WEBHOOK_URL:
         logger.info(f"Запуск через webhook: {WEBHOOK_URL}")
